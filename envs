@@ -1,0 +1,321 @@
+#!/bin/bash
+# envs -- .env sharing within a team
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2025 Abhishek Dasgupta
+
+set -eou pipefail
+
+ENVS_GIT_DIR=${XDG_DATA_HOME:-$HOME/.local/share/envs}
+
+ENVS_CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config/envs}
+ENVS_CONFIG_PRIVKEY="${ENVS_CONFIG_DIR}/privkey"
+ENVS_CONFIG_FORGE="${ENVS_CONFIG_DIR}/forge"
+
+# default keys file if .envs_keys.txt is not present
+ENVS_CONFIG_KEYS="${ENVS_CONFIG_DIR}/keys.txt"
+ENVS_DEFAULT_PRIVKEY=~/.ssh/id_ed25519
+ENVS_FILE=.envs_keys.txt
+
+envs_usage() {
+    cat << EOF
+envs -- .env sharing within a team
+
+envs implements a common use case that is faced by small teams -- how to share
+.env files, without relying on cloud based solutions (often not free) such as
+Hashicorp Vault and AWS Secrets Manager.
+
+Commands:
+
+  init <repo>             sets up initial clone of remote repo with secrets
+  privkey <key>           links private key for decryption of secrets
+  up | update             pulls latest secrets and decrypts in tree, takes
+                          optional -f parameter to force update even when
+                          local file is newer
+  forge                   sets forge URL to use, default=github.com
+  addkeys <k1> <u1>       adds age-supported keys or forge usernames
+  commit <file> [<msg>]   commits a dotfile to the repo, with optional message
+  log <file>              see git-log of corresponding encrypted file
+
+For more information, see the manual page envs(1) or online at
+https://github.com/abhidg/envs/tree/main/envs.1.scd
+
+envs stores recipient keys in a file called .envs_keys.txt in the repo root, it
+is recommended to version control this file as it does not have any secrets
+(other than a list of commented out usernames, which can be removed).
+
+envs stores dotfiles in a common repo in a subfolder that is the name of the
+repository root directory; if this conflicts, this can be changed with the '#
+repo=' directive at the top of a file.
+EOF
+}
+
+_ask_yn() {
+    read -e -r -p "▶ $1 [y/N]: " answer
+    case "$answer" in
+        [yY]) return 0;;
+        *) return 1 ;;
+    esac
+}
+
+_decrypt() {
+    local privkey="$ENVS_CONFIG_PRIVKEY"
+    local repo="$1"
+    local filename="$2"
+    local encfile="$ENVS_GIT_DIR/$repo/$filename.age"
+    if [ ! -f "$encfile" ]; then
+        echo "envs: file missing $encfile"
+        echo "  Maybe you forgot to encrypt it, try 'env commit $filename'"
+    fi
+    if [ ! -f "$privkey" ]; then
+        privkey="$ENVS_DEFAULT_PRIVKEY"
+    fi
+    tmpfile="$(mktemp -t envs)"
+    age -d -i "$privkey" "$encfile" > "$tmpfile"
+    echo "$tmpfile"
+}
+
+_encrypt() {
+    local repo="$1"
+    local filename="$2"
+    if [ ! -d "$ENVS_GIT_DIR/$repo" ]; then
+        mkdir -p "$ENVS_GIT_DIR/$repo"
+    fi
+    local encfile="$ENVS_GIT_DIR/$repo/$filename.age"
+    if [ -f .envs_keys.txt ]; then
+        age -o "$encfile" -R .envs_keys.txt "$filename"
+    elif [ -f "$ENVS_CONFIG_KEYS" ]; then
+        age -o "$encfile" -R "$ENVS_CONFIG_KEYS" "$filename"
+    else
+        echo envs encrypt: no suitable keyfile found
+        echo Use envs addkeys to create .envs_keys.txt, or store recipient keys in
+        echo "$ENVS_CONFIG_KEYS"
+        return 1
+    fi
+    echo "$encfile"
+}
+
+_assert_git_root() {
+    if [ ! -f .git ]; then
+        echo envs: run operations from the repository root
+        exit 1
+    fi 
+}
+
+_stat() {
+  local file="$1"
+  declare stat_time
+  if [[ "$(uname)" == "Darwin" ]]; then
+    stat_time=$(stat -f "%m" -- "$file")
+  else
+    stat_time=$(stat -c "%Y" -- "$file")
+  fi
+  echo "$stat_time"
+}
+
+_local_file_newer() {
+  local repo="$1"
+  local file="$2"
+  local encfile="$repo/${file}.age"
+  local git_time stat_time
+
+  # Check if file exists
+  [[ -f "$file" ]] || { echo "Error: '$file' does not exist."; return 2; }
+  [[ -f "$ENVS_GIT_DIR/$encfile" ]] || { echo "Error: '$encfile' does not exist."; return 2; }
+
+  # Get last commit time from git
+  pushd "$ENVS_GIT_DIR" > /dev/null
+    git_time=$(git log -1 --format="%ct" -- "$encfile" 2>/dev/null)
+    if [[ -z "$git_time" ]]; then
+        echo "Error: '${file}.age' is not tracked by Git or has no commits."
+        return 2
+    fi
+  popd > /dev/null
+
+  stat_time=$(_stat "$file")
+  if (( stat_time > git_time )); then
+    return 0
+  else
+    return 1
+  fi
+}
+
+envs_update() {
+    # pushd "$ENVS_GIT_DIR" > /dev/null
+    #     git pull
+    # popd > /dev/null
+    local repo="$1"
+    shift
+    local force_update="${1:-}"
+    declare tmpfile file
+    for encfile in "$ENVS_GIT_DIR/$repo/".*; do
+        encstem="$(basename "$encfile" .age)"
+        if [[ "$encstem" == "." || "$encstem" == ".." ]]; then
+            continue
+        fi
+        file="$(basename "$encfile" .age)"
+        if [ ! -f "$file" ]; then
+            tmpfile=$(_decrypt "$repo" "$file")
+            cp "$tmpfile" "$file"
+            echo updated "$file"
+        elif ! _local_file_newer "$repo" "$file" || [[ "$force_update" == "-f" ]]; then
+            tmpfile=$(_decrypt "$repo" "$file")
+            if ! git diff --no-index "$file" "$tmpfile"; then
+                if _ask_yn "Accept changes?"; then
+                    cp "$tmpfile" "$file"
+                    echo "  updated $file"
+                fi
+            else
+                echo "unchanged $file"
+            fi
+        else
+            echo "     skip $file, newer than remote"
+        fi
+    done
+}
+
+envs_commit() {
+    local repo="$1"
+    local file="$2"
+    local commit_message="${3:-update $2}"
+    local gitfile="$ENVS_GIT_DIR/$repo/${file}.age"
+    if [ -f "$gitfile" ]; then
+        tmpfile=$(_decrypt "$repo" "$file")
+        if git diff --no-index "$tmpfile" "$file"; then
+            echo "unchanged $file"
+            return 1
+        fi
+        _local_file_newer "$repo" "$file"
+        mtime_status="$?"
+        if [ "$mtime_status" -eq 1 ]; then
+            if ! _ask_yn "Remote file is newer, continue?"; then
+                return 1
+            fi
+        fi
+    fi
+    _encrypt "$repo" "$file" > /dev/null
+    encfile="${repo}/${file}.age"
+    pushd "$ENVS_GIT_DIR" > /dev/null
+        git add "$encfile"
+        git commit "$encfile" -m "$commit_message"
+        git push
+    popd > /dev/null
+}
+
+envs_ensure_dirs() {
+    if [ ! -d "$ENVS_GIT_DIR" ]; then
+        mkdir -p "$ENVS_GIT_DIR"
+    fi
+    if [ ! -d "$ENVS_CONFIG_DIR" ]; then
+        mkdir -p "$ENVS_CONFIG_DIR"
+    fi
+}
+
+envs_init() {
+    git clone "$1" "$GIT_DIR"
+}
+
+envs_get_reponame() {
+    if [ -f .envs_keys.txt ]; then
+        local line
+        read -r line < .envs_keys.txt
+
+        # Remove leading '#' and trim spaces
+        line="${line#\#}"
+        line="$(echo "$line" | xargs)"  # trims leading/trailing whitespace
+        if [[ $line == repo* ]]; then
+            echo "$line" | cut -d'=' -f2- | xargs
+            return 0
+        fi
+    fi
+    basename "$PWD"
+}
+
+envs_set_forge() {
+    echo Forge must support key retrieval using the following syntax
+    echo     https://forge-name/username.keys
+    echo "$1" > "$ENVS_CONFIG_FORGE"
+}
+
+envs_get_forge() {
+    if [ -f "$ENVS_CONFIG_FORGE" ]; then
+        cat "$ENVS_CONFIG_FORGE" 
+    else
+        echo github.com
+    fi
+}
+
+envs_privkey() {
+    ln -sf "$1" "$ENVS_CONFIG_PRIVKEY"
+}
+
+envs_getkeys() {
+    declare forge
+    forge="$(envs_get_forge)"
+    for u in "$@"; do
+        case "$u" in
+            ssh-rsa*|ssh-ed25519*|age1*) echo "$u" ;;
+            *) 
+                echo "# ${forge}/$u"
+                curl -s https://"$forge"/"$u".keys
+                ;;
+        esac
+    done
+}
+
+envs_addkeys() {
+    envs_getkeys "$@" >> "$ENVS_FILE"
+    cat "$ENVS_FILE"
+}
+
+envs_log() {
+    local repo="$1"
+    local filename="$2"
+    pushd "$ENVS_GIT_DIR" > /dev/null
+        git log "$repo/${filename}.age"
+    popd > /dev/null
+}
+
+envs_main() {
+    envs_ensure_dirs
+
+    if [ -z "${1:-}" ]; then
+        envs_usage
+        exit 0
+    fi
+    local op="$1"
+    shift
+    declare repo forge
+    repo=$(envs_get_reponame)
+    forge=$(envs_get_forge)
+
+    case "$op" in
+        init) envs_init "$1" ;;
+        up) _assert_git_root; envs_update "$repo" "$@" ;;
+        update) _assert_git_root; envs_update "$repo" "$@" ;; 
+        privkey) envs_privkey "$1" ;;
+        forge) envs_set_forge "$1" ;;
+        addkeys) _assert_git_root; envs_addkeys "$@" ;;
+        commit)
+            _assert_git_root
+            if [ -z "${1:-}" ]; then
+                echo envs commit requires a filename
+                exit 1
+            fi
+            envs_commit "$repo" "$1"
+            ;;
+        log)
+            _assert_git_root
+            if [ -z "${1:-}" ]; then
+                echo envs log requires a filename
+                exit 1
+            fi
+            envs_log "$repo" "$1"
+            ;;
+        *)
+            echo "envs: unsupported operation $op"
+            exit 1
+            ;;
+    esac
+}
+
+envs_main "$@"
