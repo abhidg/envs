@@ -117,7 +117,7 @@ _encrypt() {
 }
 
 _assert_git_root() {
-    if [ ! -f .git ]; then
+    if [ ! -d .git ]; then
         echo envs: run operations from the repository root
         exit 1
     fi 
