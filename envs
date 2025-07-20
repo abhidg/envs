@@ -56,6 +56,21 @@ repo=' directive at the top of a file.
 EOF
 }
 
+_relative_path() {
+    file="${1:-}"
+    if [ -z "$file" ]; then
+        echo "usage: _relative_path <file>"
+        return 1
+    fi
+
+    git_root=$(git rev-parse --show-toplevel) || return 1
+    abs_file=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
+
+    # Remove git root prefix from the absolute file path
+    rel_path="${abs_file#$git_root/}"
+    echo "$rel_path"
+}
+
 _ask_yn() {
     read -e -r -p "▶ $1 [y/N]: " answer
     case "$answer" in
