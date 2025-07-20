@@ -5,9 +5,16 @@
 
 set -eou pipefail
 
-ENVS_GIT_DIR=${XDG_DATA_HOME:-$HOME/.local/share/envs}
+# test mode
+if [ -z "${ENVS_TEST:-}" ]; then
+    ENVS_CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config/envs}
+    ENVS_GIT_DIR=${XDG_DATA_HOME:-$HOME/.local/share/envs}
+else
+    echo "*** envs is running in test mode ***"
+    ENVS_CONFIG_DIR=t/config
+    ENVS_GIT_DIR="${ENVS_GIT_DIR:-$(mktemp -d -u)}"
+fi
 
-ENVS_CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config/envs}
 ENVS_CONFIG_PRIVKEY="${ENVS_CONFIG_DIR}/privkey"
 ENVS_CONFIG_FORGE="${ENVS_CONFIG_DIR}/forge"
 
